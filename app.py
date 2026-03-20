@@ -1,5 +1,8 @@
 import streamlit as st
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 import re
 import time
 import tempfile
@@ -29,6 +32,27 @@ DEFAULT_NARRATION = {
     "text": "",
     "tags": "",
     "audio_generated": False,
+}
+
+DEFAULT_INTENTS = {
+    "script": "",
+    "image": "",
+    "video": "",
+    "composition": "",
+}
+
+INTENT_PLACEHOLDERS = {
+    "script": "e.g. Make it dramatic, sports commentary style, 6-8 scenes, each scene should be a single visual moment",
+    "image": "e.g. Grey pencil sketch, no face detail, cricket theme, anime storyboard style, monochrome tones",
+    "video": "e.g. Slow cinematic pans, dramatic zoom on key moments, Ken Burns effect",
+    "composition": "e.g. Energetic narration, fast-paced background music, cricket crowd ambience, dramatic tone",
+}
+
+INTENT_LABELS = {
+    "script": "Step 1: Script Generation",
+    "image": "Step 2: Image Style",
+    "video": "Step 3: Video Animation",
+    "composition": "Step 4: Final Composition",
 }
 
 # ElevenLabs default/public voices (work with any API key)
@@ -327,6 +351,8 @@ def create_project(name: str) -> dict:
         "created_at": datetime.now().isoformat(),
         "script": "",
         "scenes": [],
+        "intents": dict(DEFAULT_INTENTS),
+        "style_reference": "",
         "narration": dict(DEFAULT_NARRATION),
         "status": "new",
         "clip_duration": 4,
@@ -361,6 +387,10 @@ def migrate_project_schema(meta: dict) -> dict:
                     scene["video_generated"] = True
     if "narration" not in meta:
         meta["narration"] = dict(DEFAULT_NARRATION)
+    if "intents" not in meta:
+        meta["intents"] = dict(DEFAULT_INTENTS)
+    if "style_reference" not in meta:
+        meta["style_reference"] = ""
     return meta
 
 
@@ -407,31 +437,94 @@ def get_final_video(slug: str) -> Path | None:
 # 2. PROMPT GENERATION
 # ---------------------------------------------------------------------------
 
-def generate_image_prompt(scene_text: str) -> str:
+def generate_image_prompt(scene_text: str, image_intent: str = "",
+                          style_desc: str = "") -> str:
+    """Build the image generation prompt. Uses user's image_intent if provided."""
+    if image_intent.strip():
+        prompt = f"{image_intent.strip()}, {scene_text}"
+    else:
+        prompt = (
+            f"black and white storyboard sketch, rough pencil line art, "
+            f"cinematic composition, animatic style, {scene_text}, "
+            f"dynamic framing, perspective depth, minimal shading, soft pencil strokes, "
+            f"film storyboard frame, gesture drawing style, motion-focused composition, "
+            f"no color, no realistic rendering, no 3D, no polished illustration"
+        )
+    if style_desc:
+        prompt += f". Visual style reference: {style_desc}"
+    return prompt
+
+
+def generate_video_prompt(scene_text: str, video_intent: str = "") -> str:
+    """Build the video animation prompt. Uses user's video_intent if provided."""
+    if video_intent.strip():
+        return f"{video_intent.strip()}, {scene_text}"
     return (
-        f"Simple grey pencil sketch, minimal linework, no detailed faces, "
-        f"storyboard style, monochrome grey tones on white background, "
-        f"clean simple illustration, no shading details: {scene_text} "
-        f"16:9 composition."
+        f"animatic storyboard motion, very subtle movement, limited animation, "
+        f"slow cinematic camera movement (push-in / pan), {scene_text}, "
+        f"slight parallax effect between foreground and background, "
+        f"hand-drawn line jitter (line boil), sketch vibration effect, "
+        f"only key elements move, rest remains static, "
+        f"add subtle motion lines if action scene, "
+        f"no full animation, no morphing, no realistic motion, "
+        f"preserve original sketch style"
     )
 
 
-def generate_video_prompt(scene_text: str) -> str:
-    return f"Cinematic slow motion, gentle camera pan: {scene_text}"
-
-
-def build_scene_dicts(scene_texts: list[str]) -> list[dict]:
-    """Convert raw scene strings into structured scene dicts."""
+def build_scene_dicts(scene_texts: list[str], image_intent: str = "",
+                      video_intent: str = "",
+                      style_desc: str = "") -> list[dict]:
+    """Convert raw scene strings into structured scene dicts with intents."""
     return [
         {
             "text": t,
-            "image_prompt": generate_image_prompt(t),
-            "video_prompt": generate_video_prompt(t),
+            "image_prompt": generate_image_prompt(t, image_intent, style_desc),
+            "video_prompt": generate_video_prompt(t, video_intent),
             "image_generated": False,
             "video_generated": False,
         }
         for t in scene_texts
     ]
+
+
+def describe_style_reference(image_path: str, api_key: str) -> str:
+    """Use GPT-4o vision to describe the visual style of a reference image."""
+    from openai import OpenAI
+    client = OpenAI(api_key=api_key)
+
+    with open(image_path, "rb") as f:
+        img_b64 = base64.b64encode(f.read()).decode()
+
+    ext = Path(image_path).suffix.lower()
+    mime = "image/png" if ext == ".png" else "image/jpeg"
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "Describe the visual art style of this image in 2-3 sentences. "
+                            "Focus on: line weight, shading technique, color palette, "
+                            "level of detail, and overall artistic style. "
+                            "Be specific enough that an AI image generator could replicate this style."
+                        ),
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{mime};base64,{img_b64}",
+                        },
+                    },
+                ],
+            }
+        ],
+        max_tokens=200,
+    )
+    return response.choices[0].message.content.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -443,21 +536,24 @@ def parse_script_mock(script: str) -> list[str]:
     return [s.strip() for s in sentences if s.strip()]
 
 
-def parse_script_openai(script: str, api_key: str) -> list[str]:
+def parse_script_openai(script: str, api_key: str,
+                        script_intent: str = "") -> list[str]:
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
+
+    base_instruction = (
+        "You are a screenwriting assistant. Split the following script "
+        "into individual scene descriptions, one per line. Each scene "
+        "should be a single visual moment that can be illustrated as a "
+        "pencil sketch. Return ONLY a JSON array of strings, no markdown."
+    )
+    if script_intent.strip():
+        base_instruction += f"\n\nAdditional creative direction: {script_intent.strip()}"
+
     response = client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[
-            {
-                "role": "system",
-                "content": (
-                    "You are a screenwriting assistant. Split the following script "
-                    "into individual scene descriptions, one per line. Each scene "
-                    "should be a single visual moment that can be illustrated as a "
-                    "pencil sketch. Return ONLY a JSON array of strings, no markdown."
-                ),
-            },
+            {"role": "system", "content": base_instruction},
             {"role": "user", "content": script},
         ],
         temperature=0.3,
@@ -671,28 +767,58 @@ def animate_sketch_atlascloud(image: Image.Image, video_prompt: str,
 
         raw_data = status_resp.json()
 
-        # Response is nested: {"data": {"id": ..., "status": ..., "outputs": [...]}}
-        # Try nested first, then top-level as fallback
+        # Debug: log raw response on first poll and every 10th attempt
+        if attempt == 0 or attempt % 10 == 0:
+            st.caption(f"Debug poll #{attempt+1}: {json.dumps(raw_data)[:400]}")
+
+        # Response may be nested in various ways — try all known paths
         inner = raw_data.get("data", {}) if isinstance(raw_data.get("data"), dict) else {}
-        status = inner.get("status", "") or raw_data.get("status", "")
+        status = (
+            inner.get("status", "")
+            or raw_data.get("status", "")
+            or inner.get("state", "")
+            or raw_data.get("state", "")
+        )
+        # Normalize status string
+        status_lower = status.lower().strip() if status else ""
 
         poll_status_placeholder.info(
             f"Scene {index+1}: Status = {status} (attempt {attempt+1})")
 
-        if status in ("succeeded", "completed"):
-            # Get video URL from nested data.outputs, then fallback to top-level
+        if status_lower in ("succeeded", "completed", "success", "done", "complete"):
+            # Get video URL — try every known response shape
             outputs = inner.get("outputs", []) or raw_data.get("outputs", [])
+            video_url = ""
             if not outputs:
-                output_url = (inner.get("output", {}).get("video", "")
-                              or raw_data.get("output", {}).get("video", ""))
-                if output_url:
-                    outputs = [output_url]
-            if not outputs:
+                # Try output.video, output.url, result.video, result.url
+                for container in (inner, raw_data):
+                    for key in ("output", "result"):
+                        out_obj = container.get(key, {})
+                        if isinstance(out_obj, str) and out_obj.startswith("http"):
+                            video_url = out_obj
+                            break
+                        if isinstance(out_obj, dict):
+                            video_url = out_obj.get("video", "") or out_obj.get("url", "") or out_obj.get("video_url", "")
+                            if video_url:
+                                break
+                    if video_url:
+                        break
+                # Also try direct url/video/video_url fields
+                if not video_url:
+                    for key in ("url", "video", "video_url", "output_url"):
+                        for container in (inner, raw_data):
+                            val = container.get(key, "")
+                            if isinstance(val, str) and val.startswith("http"):
+                                video_url = val
+                                break
+                        if video_url:
+                            break
+            if not video_url and outputs:
+                video_url = outputs[0] if isinstance(outputs[0], str) else outputs[0].get("url", "") or outputs[0].get("video", "")
+            if not video_url:
+                st.warning(f"Full response for debugging: {json.dumps(raw_data)[:600]}")
                 raise RuntimeError(
-                    f"Atlascloud: Video succeeded but no outputs found. "
-                    f"Full response: {json.dumps(raw_data)[:500]}")
-
-            video_url = outputs[0] if isinstance(outputs[0], str) else outputs[0].get("url", "")
+                    f"Atlascloud: Video succeeded but no video URL found.")
             if not video_url:
                 raise RuntimeError(f"Atlascloud: Empty video URL in outputs: {outputs}")
 
@@ -704,7 +830,7 @@ def animate_sketch_atlascloud(image: Image.Image, video_prompt: str,
             poll_status_placeholder.success(f"Scene {index+1}: Video ready!")
             return out_path
 
-        elif status == "failed":
+        elif status_lower in ("failed", "error", "cancelled", "canceled"):
             error_msg = (inner.get("error", "") or raw_data.get("error", "")
                          or inner.get("message", "") or raw_data.get("message", "Unknown error"))
             poll_status_placeholder.empty()
@@ -1050,13 +1176,16 @@ def main():
 
         st.markdown('<div class="sidebar-label">Configuration</div>',
                     unsafe_allow_html=True)
-        use_mock = st.toggle("Mock Data (no API keys)", value=True)
+        use_mock = st.toggle("Mock Data (no API keys)", value=False)
 
         openai_key = st.text_input("OpenAI Key", type="password",
+                                   value=os.getenv("OPENAI_API_KEY", ""),
                                    help="GPT + DALL-E 3")
         atlas_key = st.text_input("Atlascloud Key", type="password",
-                                  help="Wan 2.6 image-to-video")
+                                  value=os.getenv("ATLASCLOUD_API_KEY", ""),
+                                  help="Vidu image-to-video")
         elevenlabs_key = st.text_input("ElevenLabs Key", type="password",
+                                       value=os.getenv("ELEVENLABS_API_KEY", ""),
                                        help="Voice narration")
 
         st.markdown('<div class="sidebar-label">Video</div>',
@@ -1115,6 +1244,103 @@ def main():
         unsafe_allow_html=True,
     )
 
+    # ── Project Settings (Intent Panels) ─────────────────────────────
+    intents = meta.get("intents", dict(DEFAULT_INTENTS))
+
+    with st.expander("Project Settings — Creative Direction", expanded=False):
+        st.caption("Tell the AI what to keep in mind at each step of the pipeline.")
+
+        intent_col1, intent_col2 = st.columns(2)
+        with intent_col1:
+            st.markdown(
+                f'<span class="prompt-label prompt-label-image">'
+                f'{INTENT_LABELS["script"]}</span>',
+                unsafe_allow_html=True,
+            )
+            new_script_intent = st.text_area(
+                "script_intent", value=intents.get("script", ""),
+                placeholder=INTENT_PLACEHOLDERS["script"],
+                height=80, key="intent_script", label_visibility="collapsed",
+            )
+
+        with intent_col2:
+            st.markdown(
+                f'<span class="prompt-label prompt-label-image">'
+                f'{INTENT_LABELS["image"]}</span>',
+                unsafe_allow_html=True,
+            )
+            new_image_intent = st.text_area(
+                "image_intent", value=intents.get("image", ""),
+                placeholder=INTENT_PLACEHOLDERS["image"],
+                height=80, key="intent_image", label_visibility="collapsed",
+            )
+
+        intent_col3, intent_col4 = st.columns(2)
+        with intent_col3:
+            st.markdown(
+                f'<span class="prompt-label prompt-label-video">'
+                f'{INTENT_LABELS["video"]}</span>',
+                unsafe_allow_html=True,
+            )
+            new_video_intent = st.text_area(
+                "video_intent", value=intents.get("video", ""),
+                placeholder=INTENT_PLACEHOLDERS["video"],
+                height=80, key="intent_video", label_visibility="collapsed",
+            )
+
+        with intent_col4:
+            st.markdown(
+                '<span class="prompt-label" style="background:rgba(234,179,8,0.12);'
+                'color:#facc15;border:1px solid rgba(234,179,8,0.3);">'
+                f'{INTENT_LABELS["composition"]}</span>',
+                unsafe_allow_html=True,
+            )
+            new_comp_intent = st.text_area(
+                "comp_intent", value=intents.get("composition", ""),
+                placeholder=INTENT_PLACEHOLDERS["composition"],
+                height=80, key="intent_composition", label_visibility="collapsed",
+            )
+
+        # Style reference image
+        st.markdown("---")
+        ref_col1, ref_col2 = st.columns([2, 1])
+        with ref_col1:
+            st.markdown("**Style Reference Image** — upload an example of the visual style you want")
+            style_ref_file = st.file_uploader(
+                "Style Reference", type=["png", "jpg", "jpeg"],
+                key="style_ref_upload", label_visibility="collapsed",
+            )
+            if style_ref_file:
+                ref_path = get_project_dir(slug) / "style_ref.png"
+                ref_img = Image.open(style_ref_file)
+                ref_img.save(str(ref_path))
+                meta["style_reference"] = "style_ref.png"
+                save_project(meta)
+                st.success("Style reference saved!")
+
+        with ref_col2:
+            existing_ref = get_project_dir(slug) / "style_ref.png"
+            if existing_ref.exists():
+                st.image(str(existing_ref), caption="Current style ref",
+                         width=150)
+                if st.button("Remove style ref", key="remove_ref"):
+                    existing_ref.unlink()
+                    meta["style_reference"] = ""
+                    save_project(meta)
+                    st.rerun()
+
+    # Auto-save intents
+    updated_intents = {
+        "script": new_script_intent,
+        "image": new_image_intent,
+        "video": new_video_intent,
+        "composition": new_comp_intent,
+    }
+    if updated_intents != intents:
+        meta["intents"] = updated_intents
+        save_project(meta)
+        intents = updated_intents
+
     # Full script display (if parsed)
     if scenes and meta.get("script"):
         st.markdown(
@@ -1144,15 +1370,34 @@ def main():
         else:
             with st.spinner("Splitting script into scenes..."):
                 meta["script"] = script
+
+                # Get style reference description if exists and OpenAI key available
+                style_desc = ""
+                style_ref_path = get_project_dir(slug) / "style_ref.png"
+                if style_ref_path.exists() and openai_key:
+                    try:
+                        style_desc = describe_style_reference(
+                            str(style_ref_path), openai_key)
+                        st.info(f"Style reference analyzed: {style_desc[:100]}...")
+                    except Exception as e:
+                        st.warning(f"Could not analyze style reference: {e}")
+
                 if use_mock:
                     raw_scenes = parse_script_mock(script)
                 else:
                     if not openai_key:
                         st.error("OpenAI API key required for parsing.")
                         st.stop()
-                    raw_scenes = parse_script_openai(script, openai_key)
+                    raw_scenes = parse_script_openai(
+                        script, openai_key,
+                        script_intent=intents.get("script", ""))
 
-                meta["scenes"] = build_scene_dicts(raw_scenes)
+                meta["scenes"] = build_scene_dicts(
+                    raw_scenes,
+                    image_intent=intents.get("image", ""),
+                    video_intent=intents.get("video", ""),
+                    style_desc=style_desc,
+                )
                 meta["narration"]["text"] = script
                 save_project(meta)
             st.rerun()
@@ -1212,8 +1457,12 @@ def main():
             narration["voice_name"] = voice_names[voice_idx]
 
         with nar_col2:
+            # Auto-suggest from composition intent if tags are empty
+            default_tags = narration.get("tags", "")
+            if not default_tags and intents.get("composition", "").strip():
+                default_tags = intents["composition"].strip()
             tags = st.text_input("Style Tags",
-                                  value=narration.get("tags", ""),
+                                  value=default_tags,
                                   placeholder="Sarcastic, Voiceover, Slow",
                                   key="narration_tags")
             narration["tags"] = tags
