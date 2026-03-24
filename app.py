@@ -20,6 +20,239 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 # ---------------------------------------------------------------------------
+# FIREBASE (conditional imports)
+# ---------------------------------------------------------------------------
+
+def _firebase_enabled() -> bool:
+    return bool(os.getenv("FIREBASE_PROJECT_ID"))
+
+_fb_admin = None
+_fb_db = None
+_fb_bucket = None
+_pyrebase_app = None
+
+if _firebase_enabled():
+    try:
+        import firebase_admin
+        from firebase_admin import credentials, firestore, storage as fb_storage
+        import pyrebase
+
+        # Initialize firebase-admin once
+        if not firebase_admin._apps:
+            sa_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH", "./firebase-sa.json")
+            if os.path.exists(sa_path):
+                cred = credentials.Certificate(sa_path)
+                firebase_admin.initialize_app(cred, {
+                    "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", ""),
+                })
+            else:
+                firebase_admin.initialize_app(options={
+                    "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", ""),
+                })
+
+        _fb_admin = firebase_admin
+        _fb_db = firestore.client()
+        _fb_bucket = fb_storage.bucket()
+
+        # Pyrebase for client auth
+        _pyrebase_config = {
+            "apiKey": os.getenv("FIREBASE_API_KEY", ""),
+            "authDomain": os.getenv("FIREBASE_AUTH_DOMAIN", ""),
+            "projectId": os.getenv("FIREBASE_PROJECT_ID", ""),
+            "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET", ""),
+            "databaseURL": "",
+            "messagingSenderId": "",
+            "appId": "",
+        }
+        _pyrebase_app = pyrebase.initialize_app(_pyrebase_config)
+    except Exception as e:
+        st.warning(f"Firebase init error: {e}. Running in local-only mode.")
+        _fb_admin = None
+        _fb_db = None
+        _fb_bucket = None
+        _pyrebase_app = None
+
+
+def _get_uid() -> str | None:
+    """Get current Firebase user UID from session state."""
+    user = st.session_state.get("firebase_user")
+    return user["uid"] if user else None
+
+
+def _fb_upload_file(slug: str, rel_path: str):
+    """Upload a local file to Firebase Storage. No-op if Firebase disabled."""
+    uid = _get_uid()
+    if not _fb_bucket or not uid:
+        return
+    local_path = PROJECTS_DIR / slug / rel_path
+    if not local_path.exists():
+        return
+    blob_path = f"users/{uid}/projects/{slug}/{rel_path}"
+    blob = _fb_bucket.blob(blob_path)
+    try:
+        blob.upload_from_filename(str(local_path))
+    except Exception:
+        pass  # Non-fatal — local file still exists
+
+
+def _fb_download_if_missing(slug: str, rel_path: str):
+    """Download from Firebase Storage if local file missing."""
+    uid = _get_uid()
+    if not _fb_bucket or not uid:
+        return
+    local_path = PROJECTS_DIR / slug / rel_path
+    if local_path.exists():
+        return
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    blob_path = f"users/{uid}/projects/{slug}/{rel_path}"
+    blob = _fb_bucket.blob(blob_path)
+    try:
+        if blob.exists():
+            blob.download_to_filename(str(local_path))
+    except Exception:
+        pass
+
+
+def _fb_save_project(meta: dict):
+    """Save project metadata to Firestore."""
+    uid = _get_uid()
+    if not _fb_db or not uid:
+        return
+    slug = meta["slug"]
+    doc_ref = _fb_db.collection("users").document(uid).collection("projects").document(slug)
+    # Remove internal fields before saving
+    data = {k: v for k, v in meta.items() if not k.startswith("_")}
+    try:
+        doc_ref.set(data)
+    except Exception:
+        pass
+
+
+def _fb_load_project(slug: str) -> dict | None:
+    """Load project metadata from Firestore."""
+    uid = _get_uid()
+    if not _fb_db or not uid:
+        return None
+    doc_ref = _fb_db.collection("users").document(uid).collection("projects").document(slug)
+    try:
+        doc = doc_ref.get()
+        if doc.exists:
+            return doc.to_dict()
+    except Exception:
+        pass
+    return None
+
+
+def _fb_list_projects() -> list[dict]:
+    """List all projects for current user from Firestore."""
+    uid = _get_uid()
+    if not _fb_db or not uid:
+        return []
+    try:
+        docs = (_fb_db.collection("users").document(uid)
+                .collection("projects")
+                .order_by("created_at", direction=firestore.Query.DESCENDING)
+                .stream())
+        return [doc.to_dict() for doc in docs]
+    except Exception:
+        return []
+
+
+def _fb_delete_project(slug: str):
+    """Delete project from Firestore and Storage."""
+    uid = _get_uid()
+    if not _fb_db or not uid:
+        return
+    # Delete Firestore doc
+    try:
+        _fb_db.collection("users").document(uid).collection("projects").document(slug).delete()
+    except Exception:
+        pass
+    # Delete Storage folder
+    if _fb_bucket:
+        try:
+            prefix = f"users/{uid}/projects/{slug}/"
+            blobs = _fb_bucket.list_blobs(prefix=prefix)
+            for blob in blobs:
+                blob.delete()
+        except Exception:
+            pass
+
+
+def _show_auth_screen():
+    """Show Firebase login/register screen."""
+    st.markdown(
+        '<div class="hero-header">'
+        '<h1>SketchMotion</h1>'
+        '<p>Sign in to access your projects</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    tab_login, tab_register = st.tabs(["Sign In", "Register"])
+
+    with tab_login:
+        with st.form("login_form"):
+            email = st.text_input("Email", key="login_email")
+            password = st.text_input("Password", type="password", key="login_pw")
+            submitted = st.form_submit_button("Sign In", type="primary",
+                                               use_container_width=True)
+            if submitted and email and password:
+                try:
+                    auth = _pyrebase_app.auth()
+                    user = auth.sign_in_with_email_and_password(email, password)
+                    st.session_state.firebase_user = {
+                        "uid": user["localId"],
+                        "email": user["email"],
+                        "token": user["idToken"],
+                    }
+                    st.rerun()
+                except Exception as e:
+                    err = str(e)
+                    if "INVALID_LOGIN_CREDENTIALS" in err:
+                        st.error("Invalid email or password.")
+                    elif "INVALID_EMAIL" in err:
+                        st.error("Invalid email address.")
+                    else:
+                        st.error(f"Sign in failed: {err[:100]}")
+
+    with tab_register:
+        with st.form("register_form"):
+            email = st.text_input("Email", key="reg_email")
+            password = st.text_input("Password", type="password", key="reg_pw")
+            password2 = st.text_input("Confirm Password", type="password",
+                                       key="reg_pw2")
+            submitted = st.form_submit_button("Create Account", type="primary",
+                                               use_container_width=True)
+            if submitted:
+                if not email or not password:
+                    st.error("Email and password required.")
+                elif password != password2:
+                    st.error("Passwords don't match.")
+                elif len(password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
+                    try:
+                        auth = _pyrebase_app.auth()
+                        user = auth.create_user_with_email_and_password(email, password)
+                        st.session_state.firebase_user = {
+                            "uid": user["localId"],
+                            "email": user["email"],
+                            "token": user["idToken"],
+                        }
+                        st.success("Account created! Redirecting...")
+                        time.sleep(1)
+                        st.rerun()
+                    except Exception as e:
+                        err = str(e)
+                        if "EMAIL_EXISTS" in err:
+                            st.error("An account with this email already exists.")
+                        elif "WEAK_PASSWORD" in err:
+                            st.error("Password is too weak. Use at least 6 characters.")
+                        else:
+                            st.error(f"Registration failed: {err[:100]}")
+
+# ---------------------------------------------------------------------------
 # CONSTANTS
 # ---------------------------------------------------------------------------
 
@@ -321,6 +554,19 @@ def _slug(name: str) -> str:
 
 
 def list_projects() -> list[dict]:
+    # Firebase mode: load from Firestore
+    if _firebase_enabled() and _get_uid():
+        fb_projects = _fb_list_projects()
+        for p in fb_projects:
+            p = migrate_project_schema(p)
+            # Ensure local dir exists as cache
+            local_dir = PROJECTS_DIR / p.get("slug", "")
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "sketches").mkdir(exist_ok=True)
+            (local_dir / "clips").mkdir(exist_ok=True)
+        return fb_projects
+
+    # Local mode
     projects = []
     for d in PROJECTS_DIR.iterdir():
         meta_path = d / "project.json"
@@ -360,6 +606,7 @@ def create_project(name: str) -> dict:
     (project_dir / "project.json").write_text(
         json.dumps(meta, indent=2), encoding="utf-8"
     )
+    _fb_save_project(meta)
     return meta
 
 
@@ -395,6 +642,32 @@ def migrate_project_schema(meta: dict) -> dict:
 
 
 def load_project(slug: str) -> dict | None:
+    # Try Firebase first
+    if _firebase_enabled() and _get_uid():
+        meta = _fb_load_project(slug)
+        if meta:
+            meta["slug"] = slug
+            meta = migrate_project_schema(meta)
+            # Ensure local cache dirs exist
+            local_dir = PROJECTS_DIR / slug
+            local_dir.mkdir(parents=True, exist_ok=True)
+            (local_dir / "sketches").mkdir(exist_ok=True)
+            (local_dir / "clips").mkdir(exist_ok=True)
+            # Download files for scenes that are marked as generated
+            for i, scene in enumerate(meta.get("scenes", [])):
+                if scene.get("image_generated"):
+                    _fb_download_if_missing(slug, f"sketches/scene_{i:03d}.png")
+                if scene.get("video_generated"):
+                    _fb_download_if_missing(slug, f"clips/clip_{i:03d}.mp4")
+            if meta.get("style_reference"):
+                _fb_download_if_missing(slug, meta["style_reference"])
+            if meta.get("narration", {}).get("audio_generated"):
+                _fb_download_if_missing(slug, "narration.mp3")
+                _fb_download_if_missing(slug, "narration.wav")
+            _fb_download_if_missing(slug, "final_output.mp4")
+            return meta
+
+    # Local fallback
     meta_path = PROJECTS_DIR / slug / "project.json"
     if meta_path.exists():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -407,10 +680,13 @@ def load_project(slug: str) -> dict | None:
 def save_project(meta: dict):
     slug = meta["slug"]
     meta_path = PROJECTS_DIR / slug / "project.json"
+    meta_path.parent.mkdir(parents=True, exist_ok=True)
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _fb_save_project(meta)
 
 
 def delete_project(slug: str):
+    _fb_delete_project(slug)
     project_dir = PROJECTS_DIR / slug
     if project_dir.exists():
         shutil.rmtree(project_dir)
@@ -635,6 +911,7 @@ def generate_single_image(meta: dict, index: int, use_mock: bool,
         img = generate_sketch_openai(scene["image_prompt"], openai_key)
 
     img.save(str(sketch_path))
+    _fb_upload_file(slug, f"sketches/scene_{index:03d}.png")
     meta["scenes"][index]["image_generated"] = True
     save_project(meta)
     return True
@@ -887,6 +1164,7 @@ def generate_single_video(meta: dict, index: int, use_mock: bool,
             # Clear in-flight flag when done (success or failure)
             st.session_state.pop(pending_key, None)
 
+    _fb_upload_file(slug, f"clips/clip_{index:03d}.mp4")
     meta["scenes"][index]["video_generated"] = True
     save_project(meta)
     return True
@@ -1093,6 +1371,11 @@ def main():
     )
     st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
+    # ── Firebase Auth Gate ────────────────────────────────────────────
+    if _firebase_enabled() and _pyrebase_app and "firebase_user" not in st.session_state:
+        _show_auth_screen()
+        st.stop()
+
     # ── Session state ─────────────────────────────────────────────────
     if "current_project" not in st.session_state:
         existing = list_projects()
@@ -1109,6 +1392,19 @@ def main():
             'SketchMotion</span></div>',
             unsafe_allow_html=True,
         )
+
+        # Firebase user info
+        if _firebase_enabled() and st.session_state.get("firebase_user"):
+            user_email = st.session_state.firebase_user.get("email", "")
+            st.markdown(
+                f'<div style="text-align:center;padding:0.2rem 0;color:#94a3b8;'
+                f'font-size:0.75rem;">{user_email}</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Sign Out", use_container_width=True, key="sign_out"):
+                del st.session_state.firebase_user
+                st.session_state.current_project = None
+                st.rerun()
 
         st.markdown('<div class="sidebar-label">Projects</div>',
                     unsafe_allow_html=True)
@@ -1314,6 +1610,7 @@ def main():
                 ref_path = get_project_dir(slug) / "style_ref.png"
                 ref_img = Image.open(style_ref_file)
                 ref_img.save(str(ref_path))
+                _fb_upload_file(slug, "style_ref.png")
                 meta["style_reference"] = "style_ref.png"
                 save_project(meta)
                 st.success("Style reference saved!")
@@ -1504,6 +1801,11 @@ def main():
                     except Exception as e:
                         st.error(f"ElevenLabs error: {e}")
                         st.stop()
+            # Upload to Firebase
+            if audio_path.endswith(".wav"):
+                _fb_upload_file(slug, "narration.wav")
+            else:
+                _fb_upload_file(slug, "narration.mp3")
             narration["audio_generated"] = True
             meta["narration"] = narration
             save_project(meta)
@@ -1660,6 +1962,7 @@ def main():
                 with st.spinner("Stitching video..."):
                     stitch_video(clip_paths, music_path, narration_path,
                                  str(get_project_dir(slug)))
+                _fb_upload_file(slug, "final_output.mp4")
 
                 meta["status"] = "completed"
                 save_project(meta)
