@@ -23,5 +23,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Other projects
+frontend/
+backend/
+
 # Claude
 .claude/

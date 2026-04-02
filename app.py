@@ -871,18 +871,17 @@ def generate_sketch_mock(scene_text: str, index: int) -> Image.Image:
 
 
 def generate_sketch_openai(prompt: str, api_key: str) -> Image.Image:
-    import requests as req
     from openai import OpenAI
     client = OpenAI(api_key=api_key)
     response = client.images.generate(
-        model="dall-e-3",
+        model="gpt-image-1.5",
         prompt=prompt,
         n=1,
-        size="1792x1024",
-        quality="standard",
+        size="1536x1024",
+        quality="low",
     )
-    image_url = response.data[0].url
-    image_data = req.get(image_url).content
+    image_b64 = response.data[0].b64_json
+    image_data = base64.b64decode(image_b64)
     return Image.open(io.BytesIO(image_data))
 
 
@@ -1476,7 +1475,7 @@ def main():
 
         openai_key = st.text_input("OpenAI Key", type="password",
                                    value=os.getenv("OPENAI_API_KEY", ""),
-                                   help="GPT + DALL-E 3")
+                                   help="GPT + GPT Image 1.5")
         atlas_key = st.text_input("Atlascloud Key", type="password",
                                   value=os.getenv("ATLASCLOUD_API_KEY", ""),
                                   help="Vidu image-to-video")
